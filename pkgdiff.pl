@@ -74,7 +74,7 @@ $SizeLimit, $QuickMode, $DiffWidth, $DiffLines, $Minimal, $NoWdiff,
 $IgnoreSpaceChange, $IgnoreAllSpace, $IgnoreBlankLines, $ExtraInfo,
 $CustomTmpDir, $HideUnchanged, $TargetName, $TargetTitle, %TargetVersion,
 $CompareDirs, $ListAddedRemoved, $SkipSubArchives, $LinksTarget,
-$SkipPattern, $AllText, $CheckByteCode, $FullMethodDiffs, $TrackUnchanged);
+$SkipPattern, $AllText, $CheckByteCode, $FullMethodDiffs, $TrackUnchanged, $RecursiveDiffPkg);
 
 my $CmdName = getFilename($0);
 
@@ -148,10 +148,13 @@ GetOptions("h|help!" => \$Help,
   "links-target=s" => \$LinksTarget,
   "check-byte-code!" => \$CheckByteCode,
   "full-method-diffs!" => \$FullMethodDiffs,
-  "track-unchanged!" => \$TrackUnchanged
+  "track-unchanged!" => \$TrackUnchanged,
+  "recursiveSuffix=s" => \$RecursiveDiffPkg
 ) or errMsg();
 
 my $TMP_DIR = undef;
+
+my $RecPkgsPattern = undef;
 
 if($CustomTmpDir)
 {
@@ -162,6 +165,14 @@ if($CustomTmpDir)
 }
 else {
     $TMP_DIR = tempdir(CLEANUP=>1);
+}
+
+if($RecursiveDiffPkg)
+{
+    my @recDiffPkgs = split(',', $RecursiveDiffPkg);
+    $RecPkgsPattern = join("|.*\.", @recDiffPkgs);
+    $RecPkgsPattern = ".*\." . $RecPkgsPattern;
+    printMsg("INFO", "using recursive diff pkg: $RecursiveDiffPkg, pattern: $RecPkgsPattern");
 }
 
 sub cleanTmp()
@@ -184,6 +195,7 @@ if(@ARGV)
 {
     if($#ARGV==1)
     { # pkgdiff OLD.pkg NEW.pkg
+        printMsg("INFO", "args: $ARGV[0] . $ARGV[1]");
         $Descriptor{1} = $ARGV[0];
         $Descriptor{2} = $ARGV[1];
     }
@@ -1464,7 +1476,8 @@ sub detectChanges()
     
     my (%AddedByDir, %RemovedByDir, %AddedByName,
     %RemovedByName, %AddedByPrefix, %RemovedByPrefix) = ();
-    
+    printMsg("INFO", "packages files: $PackageFiles{1}, $PackageFiles{2}");
+
     foreach my $Name (sort keys(%{$PackageFiles{1}}))
     { # checking old files
         my $Format = getFormat($PackageFiles{1}{$Name});
@@ -1600,6 +1613,7 @@ sub detectChanges()
     
     foreach my $Name (sort (keys(%StableFiles), keys(%RenamedFiles), keys(%MovedFiles)))
     { # checking files
+        printMsg("INFO", "pkg file stable,rename,moved name: $Name");
         my $Path = $PackageFiles{1}{$Name};
         my $Size = getSize($Path);
         if($Debug) {
@@ -1620,8 +1634,10 @@ sub detectChanges()
         { # moved files
             $NewPath = $PackageFiles{2}{$NewName};
         }
-        
+
         my ($Changed, $DLink, $RLink, $Rate, $Adv) = compareFiles($Path, $NewPath, $Name, $NewName);
+        
+        printMsg("INFO", "pkg file compare : $Path, $NewPath, $Name, $NewName and result is $Changed, $DLink, $RLink, $Rate, $Adv");
         my %Details = %{$Adv};
         
         if($Changed==1 or $Changed==3)
@@ -2413,12 +2429,11 @@ sub cmdFind(@)
         $Name = shift(@_);
     }
     if(@_) {
-        $MaxDepth = shift(@_);
-    }
-    if(@_) {
         $UseRegex = shift(@_);
     }
-    
+    if(@_) {
+        $MaxDepth = shift(@_);
+    }
     $Path = getAbsPath($Path);
     
     if(-d $Path and -l $Path
@@ -2438,7 +2453,7 @@ sub cmdFind(@)
     { # wildcards
         $Cmd .= " -name \"$Name\"";
     }
-    
+    # printMsg("DEBUG", "cmd is $Cmd");
     my $Res = `$Cmd 2>\"$TMP_DIR/null\"`;
     if($?) {
         printMsg("ERROR", "problem with \'find\' utility ($?): $!");
@@ -2447,6 +2462,7 @@ sub cmdFind(@)
     my @Files = split(/\n/, $Res);
     if($Name and $UseRegex)
     { # regex
+        # printMsg("DEBUG", "cmd is grep { /\A$Name\Z/ }");
         @Files = grep { /\A$Name\Z/ } @Files;
     }
     
@@ -3210,7 +3226,46 @@ sub readPackage($$)
         }
         $Group{"Format"}{uc(getExt($Path))} = 1;
     }
+    printMsg("DEBUG", "get Format $Format CPath $CPath of $Path");
+    recursiveUnPkg($CPath);
     return ($CPath, \%Attr);
+}
+
+sub recursiveUnPkg($)
+{
+    printMsg("DEBUG", "get recursiveUnPkg args $_[0]");
+    my @Files = cmdFind($_[0], "f", $RecPkgsPattern, 1);
+    printMsg("DEBUG", "get files @Files");
+    my $len = scalar @Files;
+    if ($len == 0) {
+        return;
+    }
+    foreach my $ra (@Files){
+        unpkg($ra);
+    }
+}
+
+sub unpkg($)
+{
+    my $Path = $_[0];
+    my $Format = getFormat($Path);
+    my $TarDir = $Path."_tmp";
+    rename($Path, $TarDir);
+    my $CPath = getDirname($Path)."/".getFilename($Path);
+    if($Format eq "RPM" or $Format eq "SRPM")
+    { # RPM or SRPM package
+        mkpath($CPath);
+        system("cd \"$CPath\" && rpm2cpio \"".abs_path($TarDir)."\" | cpio -id --quiet");
+        if($?) {
+            exitStatus("Error", "can't extract package ");
+        }
+    }
+    elsif($Format eq "ARCHIVE")
+    { # TAR.GZ and others
+        if(unpackArchive(abs_path($TarDir), $CPath)!=0) {
+            exitStatus("Error", "can't extract package \'".getFilename($Path)."\'");
+        }
+    }
 }
 
 sub parseVersion($)
@@ -3934,6 +3989,8 @@ sub scenario()
     
     my $Fmt1 = getFormat($Descriptor{1});
     my $Fmt2 = getFormat($Descriptor{2});
+
+    printMsg("DEBUG", "compare fmt $Fmt1 vs $Fmt2");
     
     my ($Ph1, $Ph2) = ();
     
@@ -4112,7 +4169,7 @@ sub scenario()
     }
     
     if($CustomTmpDir) {
-        cleanTmp();
+        # cleanTmp();
     }
     
     exit($ERROR_CODE{$RESULT{"status"}});
